@@ -1,0 +1,6 @@
+{
+  "name": "FinBuddy – Personal Financial Literacy Tutor",
+  "description": "Learn Money. Build Confidence. Secure Your Future. An interactive AI financial literacy tutor for mastering budgeting, saving, banking, investing, and Indian personal finance.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
