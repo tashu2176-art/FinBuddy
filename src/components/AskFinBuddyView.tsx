@@ -134,17 +134,25 @@ function renderFormattedMessage(text: string): React.ReactNode {
 
     if (!trimmed) {
       elements.push(<div key={idx} className="h-2" />);
-    } else if (trimmed.startsWith('### ')) {
+    } else if (/^#{1,4}\s+/.test(trimmed)) {
       elements.push(
-        <h4 key={idx} className="text-sm font-bold text-[#0F172A] mt-2">
-          {formatInlineBold(trimmed.replace(/^###\s+/, ''))}
+        <h4 key={idx} className="text-sm font-bold text-[#0F172A] mt-2.5">
+          {formatInlineBold(trimmed.replace(/^#{1,4}\s+/, ''))}
         </h4>
       );
-    } else if (trimmed.startsWith('- ')) {
+    } else if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
       elements.push(
         <div key={idx} className="flex items-start gap-2 pl-2 text-sm leading-relaxed">
           <span className="text-[#0EA5E9] font-bold">•</span>
           <span>{formatInlineBold(trimmed.slice(2))}</span>
+        </div>
+      );
+    } else if (/^\d+\.\s+/.test(trimmed)) {
+      const match = trimmed.match(/^(\d+\.)\s+(.*)$/);
+      elements.push(
+        <div key={idx} className="flex items-start gap-2 pl-2 text-sm leading-relaxed">
+          <span className="text-[#0EA5E9] font-bold tabular-nums">{match ? match[1] : '•'}</span>
+          <span>{formatInlineBold(match ? match[2] : trimmed)}</span>
         </div>
       );
     } else {

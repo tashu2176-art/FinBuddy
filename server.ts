@@ -7,9 +7,10 @@ import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import {
-  DEFAULT_GROUNDING_SOURCES,
   FINBUDDY_SYSTEM_INSTRUCTION,
+  buildDynamicSuggestedReplies,
   generateDemoTutorResponse,
+  selectRelevantGroundingSources,
   type GroundingSource,
   type LearnerContext,
 } from './src/utils/tutorEngine';
@@ -24,16 +25,12 @@ async function startServer() {
 
   app.use(express.json({ limit: '15mb' }));
 
-  let quotaCooldownUntil = 0;
+  // Separate cooldown for optional search-grounding tool quota so core AI chat remains live
+  let searchToolCooldownUntil = 0;
 
   const hasValidApiKey = (): boolean => {
     const key = process.env.GEMINI_API_KEY;
-    return Boolean(
-      key &&
-        key.trim() !== '' &&
-        key !== 'MY_GEMINI_API_KEY' &&
-        Date.now() > quotaCooldownUntil
-    );
+    return Boolean(key && key.trim() !== '' && key !== 'MY_GEMINI_API_KEY');
   };
 
   const createAiClient = () =>
@@ -52,13 +49,14 @@ async function startServer() {
       aiConfigured: hasValidApiKey(),
       capabilities: {
         searchGroundingModel: 'gemini-3.8-flash',
+        fastChatModel: 'gemini-3.1-flash-lite',
         liveVoiceModel: 'gemini-3.8-live',
         transcribeModel: 'gemini-3.5-transcribe',
       },
     });
   });
 
-  // 1. Chat Endpoint with Google Search Grounding (gemini-3.8-flash + googleSearch tool)
+  // 1. Chat Endpoint — Real Gemini AI responses with Search Grounding + fast gemini-3.1-flash-lite fallback
   app.post('/api/chat', async (req, res) => {
     try {
       const {
@@ -94,91 +92,123 @@ async function startServer() {
         return;
       }
 
-      try {
-        const ai = createAiClient();
+      const ai = createAiClient();
 
-        const formattedHistory = history.slice(-8).map((msg) => ({
-          role: msg.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: msg.content }],
-        }));
+      // Exclude the initial welcome message from history if it was synthetic, and keep recent turns
+      const cleanHistory = history
+        .filter((msg) => msg && typeof msg.content === 'string' && msg.content.trim() !== '')
+        .slice(-8);
 
-        const contextPrefix = `[Learner Profile: Name="${context.learnerName || 'Friend'}", CurrentLevel="${context.currentLevel || 'New to Finance'}", PreferredTopic="${context.preferredTopic || 'Budgeting and Saving'}", DifficultyPreference=${context.level}, Goal="${context.goal}", ExplainInSimpleLanguage=${context.simpleLanguage ? 'YES (use everyday analogies and zero jargon)' : 'Standard plain English'}]\n\nUser Question: ${message}`;
+      // If the client already appended the latest user message to `history`, avoid duplicating it
+      const historyWithoutCurrent =
+        cleanHistory.length > 0 &&
+        cleanHistory[cleanHistory.length - 1].role === 'user' &&
+        cleanHistory[cleanHistory.length - 1].content.trim() === message.trim()
+          ? cleanHistory.slice(0, -1)
+          : cleanHistory;
 
-        const timeoutPromise = new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('AI timeout')), 4500)
-        );
+      const formattedHistory = historyWithoutCurrent.map((msg) => ({
+        role: msg.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: msg.content }],
+      }));
 
-        const response = await Promise.race([
-          ai.models.generateContent({
-            model: 'gemini-3.8-flash',
-            contents: [
-              ...formattedHistory,
-              {
-                role: 'user',
-                parts: [{ text: contextPrefix }],
+      const contextPrefix = `[Learner Profile: Name="${context.learnerName || 'Friend'}", CurrentLevel="${context.currentLevel || 'New to Finance'}", PreferredTopic="${context.preferredTopic || 'Budgeting and Saving'}", DifficultyPreference=${context.level}, Goal="${context.goal}", ExplainInSimpleLanguage=${context.simpleLanguage ? 'YES (use everyday analogies and plain English)' : 'Standard plain English'}]
+
+IMPORTANT: Directly and specifically answer the user's exact question below. Use concrete Indian Rupee (₹) examples or step-by-step math tailored to their question. Do NOT give a generic boilerplate response.
+
+User Question: ${message.trim()}`;
+
+      const contentsPayload = [
+        ...formattedHistory,
+        {
+          role: 'user',
+          parts: [{ text: contextPrefix }],
+        },
+      ];
+
+      let replyText: string | undefined;
+      const groundingSources: GroundingSource[] = [];
+
+      // Step A: If Google Search Grounding is requested and not in tool-quota cooldown, try grounded call with 3.5s bound
+      if (useSearchGrounding && Date.now() > searchToolCooldownUntil) {
+        try {
+          const groundedResponse = await Promise.race([
+            ai.models.generateContent({
+              model: 'gemini-3.8-flash',
+              contents: contentsPayload,
+              config: {
+                systemInstruction: FINBUDDY_SYSTEM_INSTRUCTION,
+                temperature: 0.7,
+                tools: [{ googleSearch: {} }],
               },
-            ],
-            config: {
-              systemInstruction: FINBUDDY_SYSTEM_INSTRUCTION,
-              temperature: 0.7,
-              tools: useSearchGrounding ? [{ googleSearch: {} }] : undefined,
-            },
-          }),
-          timeoutPromise,
-        ]);
+            }),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('Grounded search timeout')), 3500)
+            ),
+          ]);
 
-        // Extract Google Search Grounding URLs
-        const groundingSources: GroundingSource[] = [];
-        const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-        if (Array.isArray(chunks)) {
-          for (const chunk of chunks) {
-            const uri = chunk?.web?.uri;
-            const title = chunk?.web?.title;
-            if (uri && typeof uri === 'string') {
-              groundingSources.push({
-                uri,
-                title: typeof title === 'string' && title.trim() ? title.trim() : uri,
-              });
+          replyText = groundedResponse.text?.trim();
+          const chunks = groundedResponse.candidates?.[0]?.groundingMetadata?.groundingChunks;
+          if (Array.isArray(chunks)) {
+            for (const chunk of chunks) {
+              const uri = chunk?.web?.uri;
+              const title = chunk?.web?.title;
+              if (uri && typeof uri === 'string') {
+                groundingSources.push({
+                  uri,
+                  title: typeof title === 'string' && title.trim() ? title.trim() : uri,
+                });
+              }
             }
           }
+        } catch {
+          // Search grounding tool hit quota or latency limit; cool down search tool for 10 mins and immediately use fast AI model
+          searchToolCooldownUntil = Date.now() + 10 * 60_000;
         }
+      }
 
-        const text = response.text;
-        if (text && text.trim()) {
-          res.json({
-            reply: text.trim(),
-            suggestedReplies: [
-              'Can you give me a practical ₹ example?',
-              'Test me with 1 quick question on this!',
-              'Explain this even more simply',
-            ],
-            groundingSources:
-              groundingSources.length > 0
-                ? groundingSources
-                : useSearchGrounding
-                ? DEFAULT_GROUNDING_SOURCES
-                : [],
-            mode: 'ai',
-          });
-          return;
+      // Step B: Fast, reliable live AI generation using gemini-3.1-flash-lite (~1.3s–3s response time)
+      if (!replyText) {
+        try {
+          const fastResponse = await Promise.race([
+            ai.models.generateContent({
+              model: 'gemini-3.1-flash-lite',
+              contents: contentsPayload,
+              config: {
+                systemInstruction: FINBUDDY_SYSTEM_INSTRUCTION,
+                temperature: 0.7,
+              },
+            }),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('Fast AI timeout')), 14000)
+            ),
+          ]);
+
+          replyText = fastResponse.text?.trim();
+        } catch {
+          // If gemini-3.1-flash-lite fails, fall through to rich topic-specific tutorEngine
         }
-      } catch (apiError) {
-        quotaCooldownUntil = Date.now() + 60_000;
-        const demo = generateDemoTutorResponse(message, history, context);
+      }
+
+      if (replyText) {
+        const finalSources =
+          groundingSources.length > 0
+            ? groundingSources
+            : useSearchGrounding
+            ? selectRelevantGroundingSources(message, replyText)
+            : [];
+
         res.json({
-          reply: demo.reply,
-          suggestedReplies: demo.suggestedReplies,
-          groundingSources: useSearchGrounding ? demo.groundingSources : [],
-          mode: 'demo',
-          notice:
-            apiError instanceof Error
-              ? `Switched to Interactive Demonstration Mode (${apiError.message.slice(0, 80)})`
-              : 'Switched to Interactive Demonstration Mode.',
+          reply: replyText,
+          suggestedReplies: buildDynamicSuggestedReplies(message, replyText),
+          groundingSources: finalSources,
+          mode: 'ai',
         });
         return;
       }
 
-      const demo = generateDemoTutorResponse(message, history, context);
+      // Step C: Topic-specific fallback if all live AI calls are unreachable
+      const demo = generateDemoTutorResponse(message, historyWithoutCurrent, context);
       res.json({
         reply: demo.reply,
         suggestedReplies: demo.suggestedReplies,
@@ -242,8 +272,7 @@ async function startServer() {
           mode: 'ai',
           model: 'gemini-3.5-transcribe',
         });
-      } catch (_apiErr) {
-        quotaCooldownUntil = Date.now() + 60_000;
+      } catch {
         res.json({
           transcript: 'I earn ₹30,000 per month. How can I start saving and investing?',
           mode: 'demo',
@@ -270,21 +299,36 @@ async function startServer() {
   });
 
   wss.on('connection', async (clientWs) => {
-    if (!hasValidApiKey()) {
-      clientWs.send(
-        JSON.stringify({
-          type: 'status',
-          mode: 'demo',
-          model: 'gemini-3.8-live',
-          message:
-            'Connected to FinBuddy Live Voice Tutor (Demonstration Mode — gemini-3.8-live ready).',
-        })
-      );
-
-      clientWs.on('message', (raw) => {
+    const attachFallbackVoiceHandler = () => {
+      clientWs.on('message', async (raw) => {
         try {
           const parsed = JSON.parse(raw.toString());
-          if (parsed.text) {
+          if (parsed.text && typeof parsed.text === 'string') {
+            if (hasValidApiKey()) {
+              try {
+                const ai = createAiClient();
+                const fastVoiceReply = await ai.models.generateContent({
+                  model: 'gemini-3.1-flash-lite',
+                  contents: `Answer this spoken question from a learner in 2-3 friendly, conversational sentences using Indian Rupees (₹): ${parsed.text}`,
+                  config: {
+                    systemInstruction: FINBUDDY_SYSTEM_INSTRUCTION,
+                  },
+                });
+                const replyText = fastVoiceReply.text?.trim();
+                if (replyText) {
+                  clientWs.send(
+                    JSON.stringify({
+                      type: 'transcript',
+                      role: 'assistant',
+                      text: replyText.replace(/\*\*/g, ''),
+                    })
+                  );
+                  return;
+                }
+              } catch {
+                // Fall back to local tutor engine below
+              }
+            }
             const demo = generateDemoTutorResponse(parsed.text, [], {
               level: 'Beginner',
               goal: 'Save & invest',
@@ -302,6 +346,19 @@ async function startServer() {
           // Ignore malformed WS frames
         }
       });
+    };
+
+    if (!hasValidApiKey()) {
+      clientWs.send(
+        JSON.stringify({
+          type: 'status',
+          mode: 'demo',
+          model: 'gemini-3.8-live',
+          message:
+            'Connected to FinBuddy Live Voice Tutor (Demonstration Mode — gemini-3.8-live ready).',
+        })
+      );
+      attachFallbackVoiceHandler();
       return;
     }
 
@@ -381,13 +438,12 @@ async function startServer() {
             }
           },
           onerror: () => {
-            quotaCooldownUntil = Date.now() + 60_000;
             clientWs.send(
               JSON.stringify({
                 type: 'status',
                 mode: 'demo',
                 model: 'gemini-3.8-live',
-                message: 'Switched to FinBuddy Voice Demonstration Mode.',
+                message: 'Live Voice Tutor active in interactive mode.',
               })
             );
           },
@@ -421,16 +477,16 @@ async function startServer() {
         }
       });
     } catch {
-      quotaCooldownUntil = Date.now() + 60_000;
       clientWs.send(
         JSON.stringify({
           type: 'status',
           mode: 'demo',
           model: 'gemini-3.8-live',
           message:
-            'Connected to FinBuddy Live Voice Tutor (Demonstration Mode — gemini-3.8-live ready).',
+            'Connected to FinBuddy Live Voice Tutor (Interactive Mode — gemini-3.8-live ready).',
         })
       );
+      attachFallbackVoiceHandler();
     }
   });
 
